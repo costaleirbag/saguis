@@ -118,6 +118,47 @@ def predict_all_logits(model, loader, device):
     logits = torch.cat(logits, dim=0)
     return ys, logits
 
+def compute_probs_and_metrics(logits, y_true, pos_idx):
+    """Retorna (probs_pos, f1_macro, auroc, best_th, flipped) escolhendo a melhor orientação."""
+    if len(logits) == 0:
+        return [], float("nan"), float("nan"), 0.5, False
+
+    probs_pos = torch.softmax(logits, dim=1)[:, pos_idx].numpy().tolist()
+    # Métricas na orientação direta
+    y_pred = [1 if p >= 0.5 else 0 for p in probs_pos]
+    f1_dir = f1_score(y_true, y_pred, average="macro")
+    try:
+        auroc_dir = roc_auc_score(y_true, probs_pos)
+    except ValueError:
+        auroc_dir = float("nan")
+
+    # Métricas na orientação invertida (caso classe positiva tenha sido escolhida “ao contrário”)
+    probs_neg = (1.0 - np.array(probs_pos)).tolist()
+    y_pred_neg = [1 if p >= 0.5 else 0 for p in probs_neg]
+    f1_inv = f1_score(y_true, y_pred_neg, average="macro")
+    try:
+        auroc_inv = roc_auc_score(y_true, probs_neg)
+    except ValueError:
+        auroc_inv = float("nan")
+
+    # Escolhe a melhor orientação pelo AUROC (mais estável)
+    flipped = False
+    f1_best, auroc_best, probs_best = f1_dir, auroc_dir, probs_pos
+    if (not np.isnan(auroc_inv)) and (np.isnan(auroc_dir) or auroc_inv > auroc_dir):
+        f1_best, auroc_best, probs_best = f1_inv, auroc_inv, probs_neg
+        flipped = True
+
+    # Threshold sweep para F1 macro
+    ths = np.linspace(0.05, 0.95, 19)
+    best_f1, best_th = 0.0, 0.5
+    for th in ths:
+        yp = [1 if p >= th else 0 for p in probs_best]
+        f1 = f1_score(y_true, yp, average="macro")
+        if f1 > best_f1:
+            best_f1, best_th = f1, th
+
+    return probs_best, float(f1_best), float(auroc_best), float(best_th), flipped
+
 
 # -------------------- main --------------------
 
@@ -141,6 +182,8 @@ def main():
     p.add_argument("--auto_resume", action="store_true", help="se existir out_dir/last.pth, retoma automaticamente")
     p.add_argument("--pos_class", type=str, default="nao_hibrido",
                    help="nome da classe positiva para AUROC/threshold (ex.: 'hibrido' ou 'nao_hibrido')")
+    p.add_argument("--ema_decay", type=float, default=0.99,
+                   help="EMA decay (use menor p/ datasets e treinos pequenos; ex.: 0.99)")
     args = p.parse_args()
 
     device = get_device()
@@ -161,7 +204,6 @@ def main():
 
     # índice da classe positiva para métricas probabilísticas
     if args.pos_class not in class_to_idx:
-        # fallback: usa a maior classe (índice 1) — mas melhor avisar
         print(f"[warn] --pos_class '{args.pos_class}' não está em {list(class_to_idx.keys())}. "
               f"Usando a última classe por padrão.")
         pos_idx = max(class_to_idx.values())
@@ -192,7 +234,8 @@ def main():
     ) if mixup_active else None
     loss_fn = SoftTargetCrossEntropy() if mixup_active else LabelSmoothingCrossEntropy(smoothing=args.smoothing)
 
-    ema = ModelEmaV2(model, decay=0.9999)
+    # EMA com decay configurável
+    ema = ModelEmaV2(model, decay=args.ema_decay)
 
     best_acc = 0.0
     best_path = Path(args.out_dir) / "best_model.pth"
@@ -215,7 +258,6 @@ def main():
             ema.module.load_state_dict(ckpt["ema_state"])
         best_acc = ckpt.get("best_acc", 0.0)
         start_epoch = ckpt.get("epoch", -1) + 1
-        # Em caso de retomar depois do ponto de unfreeze
         if start_epoch >= args.freeze_epochs:
             for p in base_params:
                 p.requires_grad_(True)
@@ -244,6 +286,7 @@ def main():
             "num_workers": args.num_workers,
             "data_dir": args.data_dir,
             "pos_class": args.pos_class,
+            "ema_decay": args.ema_decay,
         })
         if ckpt_path:
             mlflow.set_tag("resume_from", str(ckpt_path))
@@ -262,36 +305,31 @@ def main():
                 )
                 scheduler.step()
 
+                # Avaliações
                 va_loss, va_acc = evaluate(model, val_dl, device)
                 ema_va_loss, ema_va_acc = evaluate(ema.module, val_dl, device)
 
-                # métricas macro (EMA)
-                y_true, logits = predict_all_logits(ema.module, val_dl, device)
-                if len(logits) > 0:
-                    probs = torch.softmax(logits, dim=1)[:, pos_idx].numpy().tolist()
-                    y_pred = [1 if p >= 0.5 else 0 for p in probs]
-                    f1_macro = f1_score(y_true, y_pred, average="macro")
-                    try:
-                        auroc = roc_auc_score(y_true, probs)
-                    except ValueError:
-                        auroc = float("nan")
+                # ----- Métricas probabilísticas (BASE e EMA), com correção de orientação -----
+                y_true_base, logits_base = predict_all_logits(model, val_dl, device)
+                probs_b, f1_b, auroc_b, best_th_b, flipped_b = compute_probs_and_metrics(
+                    logits_base, y_true_base, pos_idx
+                )
 
-                    # threshold sweep (salvar como métrica por época)
-                    ths = np.linspace(0.05, 0.95, 19)
-                    best_f1, best_th = 0.0, 0.5
-                    for th in ths:
-                        yp = [1 if p >= th else 0 for p in probs]
-                        f1 = f1_score(y_true, yp, average="macro")
-                        if f1 > best_f1:
-                            best_f1, best_th = f1, th
-                    mlflow.log_metric("best_threshold", float(best_th), step=epoch + 1)
-                    mlflow.log_metrics({"ema_f1_macro": f1_macro, "ema_auroc": auroc}, step=epoch + 1)
-                else:
-                    best_th = 0.5
-                    f1_macro = float("nan")
-                    auroc = float("nan")
+                y_true_ema, logits_ema = predict_all_logits(ema.module, val_dl, device)
+                probs_e, f1_e, auroc_e, best_th_e, flipped_e = compute_probs_and_metrics(
+                    logits_ema, y_true_ema, pos_idx
+                )
+
+                # Gap médio entre parâmetros (modelo vs EMA) — sanidade do EMA
+                with torch.no_grad():
+                    diffs = []
+                    for p_w, q_w in zip(model.parameters(), ema.module.parameters()):
+                        diffs.append((p_w.detach().float() - q_w.detach().float()).abs().mean().item())
+                    ema_gap = float(np.mean(diffs)) if len(diffs) else 0.0
 
                 current_lr = optimizer.param_groups[0]["lr"]
+
+                # Logs no MLflow
                 mlflow.log_metrics({
                     "train_loss": tr_loss,
                     "train_acc": tr_acc,
@@ -299,15 +337,29 @@ def main():
                     "val_acc": va_acc,
                     "ema_val_loss": ema_va_loss,
                     "ema_val_acc": ema_va_acc,
+                    "base_f1_macro": f1_b,
+                    "base_auroc": auroc_b,
+                    "base_best_threshold": best_th_b,
+                    "ema_f1_macro": f1_e,
+                    "ema_auroc": auroc_e,
+                    "ema_best_threshold": best_th_e,
+                    "ema_param_gap_l1_mean": ema_gap,
                     "lr": current_lr,
                 }, step=epoch + 1)
 
+                mlflow.set_tags({
+                    "base_orientation_flipped": str(flipped_b),
+                    "ema_orientation_flipped": str(flipped_e),
+                })
+
+                # Print humano
                 print(
                     f"Train loss {tr_loss:.4f} | Train acc {tr_acc:.2f}% | "
                     f"Val loss {va_loss:.4f} | Val acc {va_acc:.2f}% | "
                     f"EMA Val loss {ema_va_loss:.4f} | EMA Val acc {ema_va_acc:.2f}% | "
-                    f"F1(macro) {f1_macro:.3f} | AUROC {auroc:.3f} | LR {current_lr:.6f} | "
-                    f"best_th {best_th:.2f}"
+                    f"[BASE] F1 {f1_b:.3f} AUROC {auroc_b:.3f} th {best_th_b:.2f} flip={flipped_b} | "
+                    f"[EMA]  F1 {f1_e:.3f} AUROC {auroc_e:.3f} th {best_th_e:.2f} flip={flipped_e} | "
+                    f"EMA_gap {ema_gap:.3e} | LR {current_lr:.6f}"
                 )
 
                 # ----- save last checkpoint (sempre) -----
