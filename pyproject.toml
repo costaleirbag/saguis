@@ -34,8 +34,10 @@ ipykernel = "^6.29.5"
 
 [tool.poetry.scripts]
 saguis-download = "app.download_images:main"
-saguis-train    = "app.train:main"      
-saguis-infer    = "app.infer:main"       
+saguis-train    = "app.train:main"
+saguis-infer    = "app.infer:main"
+saguis-split    = "app.split_dataset:main"
+
 
 [build-system]
 requires = ["poetry-core"]
