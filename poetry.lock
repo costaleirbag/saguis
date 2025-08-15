@@ -4290,6 +4290,35 @@ MarkupSafe = ">=2.1.1"
 watchdog = ["watchdog (>=2.3)"]
 
 [[package]]
+name = "xgboost"
+version = "3.0.4"
+description = "XGBoost Python Package"
+optional = false
+python-versions = ">=3.10"
+files = [
+    {file = "xgboost-3.0.4-py3-none-macosx_10_15_x86_64.whl", hash = "sha256:d613a7abed8e375c2328030dac39cb29d934ae6d9cc4ab8799ed0c36d2a9d485"},
+    {file = "xgboost-3.0.4-py3-none-macosx_12_0_arm64.whl", hash = "sha256:13a7dcf77fdfbedea385aa0767844d7da97d3bbdb2f2675b9b774656bdb11bb4"},
+    {file = "xgboost-3.0.4-py3-none-manylinux2014_aarch64.whl", hash = "sha256:db4d52ba712ae831b3bea9545c9e6ee502a0f6dcdcd581d6234b2e90c5eff485"},
+    {file = "xgboost-3.0.4-py3-none-manylinux2014_x86_64.whl", hash = "sha256:ae2a17cd7f29f4bb84ab8a77d5c43b75c42f5dbd0a4cb9dd71a64e0dcf7ce23f"},
+    {file = "xgboost-3.0.4-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:03fbe7be1a1e2748a9632c807fedfe0c26f5d85a497604f50ef98c96e6e6c15a"},
+    {file = "xgboost-3.0.4-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:ecb151a4e12cbc5b6045e08fa034741ebfa2c033d5f5f933f5e454d8e46477f2"},
+    {file = "xgboost-3.0.4-py3-none-win_amd64.whl", hash = "sha256:b57d05fbca52fe44da073f7e89b75998eb4f7b4fcaec973382d3fdf1ac30d600"},
+    {file = "xgboost-3.0.4.tar.gz", hash = "sha256:498e79e545a9f85f372c03cdaf55357ddeec88d67a9b0c0608696ce05c681268"},
+]
+
+[package.dependencies]
+numpy = "*"
+nvidia-nccl-cu12 = {version = "*", markers = "platform_system == \"Linux\" and platform_machine != \"aarch64\""}
+scipy = "*"
+
+[package.extras]
+dask = ["dask", "distributed", "pandas"]
+pandas = ["pandas (>=1.2)"]
+plotting = ["graphviz", "matplotlib"]
+pyspark = ["cloudpickle", "pyspark", "scikit-learn"]
+scikit-learn = ["scikit-learn"]
+
+[[package]]
 name = "zipp"
 version = "3.23.0"
 description = "Backport of pathlib-compatible object wrapper for zip files"
@@ -4311,4 +4340,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.10,<3.13"
-content-hash = "9be4919f02123fd0600f5c22eb712da2ac9844de27dfe66c0db43a2adcad288a"
+content-hash = "cd42fb4d4ba141b385bc0d977bd3830a65e8d9932f9b6c4bb707cff02e055f4b"

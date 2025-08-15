@@ -30,16 +30,20 @@ mlflow = "^3.2.0"
 scikit-learn = "^1.7.1"
 albumentations = "^2.0.8"
 opencv-python-headless = "^4.12.0.88"
+xgboost = "^3.0.4"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"
 
 [tool.poetry.scripts]
-saguis-download = "app.download_images:main"
-saguis-train    = "app.train:main"
-saguis-infer    = "app.infer:main"
-saguis-split    = "app.split_dataset:main"
-
+saguis-download          = "app.download_images:main"
+saguis-train             = "app.train:main"
+saguis-infer             = "app.infer:main"
+saguis-split             = "app.split_dataset:main"
+saguis-xgboost           = "app.xgboost:main"
+saguis-location          = "app.prepare_location_features_and_map:main"
+saguis-download-prepared = "app.download_from_prepared:main"
+saguis-sanity-check      = "app.download_sanity_check:main"
 
 [build-system]
 requires = ["poetry-core"]
