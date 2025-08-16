@@ -1,50 +1,28 @@
 import os
 import random
 from pathlib import Path
+import hashlib
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, random_split, WeightedRandomSampler
 from torchvision import datasets, transforms
-from dataclasses import dataclass
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-import numpy as np
 from PIL import Image
 
-import pandas as pd
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
 from glob import glob
 from datetime import datetime
-import hashlib
+
+# ----------------------- utils -----------------------
 
 def sha1_name(url: str, n=16) -> str:
+    """Nome de arquivo usado no download: sha1(image_url)[:n] + '.jpg'."""
     return hashlib.sha1(str(url).encode("utf-8")).hexdigest()[:n] + ".jpg"
 
-_FUSION_TAB = None  # será setado por build_dataloaders_fusion
-
-def fusion_collate(batch):
-    """
-    batch: [(img, y, path), ...] vindo de PathImageFolder
-    Usa o lookup global _FUSION_TAB para montar o tensor tabular.
-    """
-    from pathlib import Path
-    import numpy as np
-    import torch
-
-    assert _FUSION_TAB is not None, "Lookup tabular (_FUSION_TAB) não inicializado."
-
-    imgs, ys, paths = zip(*batch)
-    fnames = [Path(p).name for p in paths]  # '<sha1>.jpg'
-
-    tabs = []
-    for nm in fnames:
-        v = _FUSION_TAB.vector_for_name(nm)
-        if v is None:
-            v = np.zeros(len(_FUSION_TAB.cols_order), dtype=np.float32)
-        tabs.append(v)
-
-    tabs = torch.tensor(np.stack(tabs, axis=0), dtype=torch.float32)
-    imgs = torch.stack(imgs, dim=0)
-    ys   = torch.tensor(ys, dtype=torch.long)
-    return imgs, tabs, ys
 
 @dataclass
 class Args:
@@ -56,6 +34,8 @@ class Args:
     aug_preset: str = "strong"     # "none" | "light" | "strong"
 
 
+# ---------------- ImageFolder helpers ----------------
+
 class PathImageFolder(datasets.ImageFolder):
     """Retorna (img, target, path)."""
     def __getitem__(self, index):
@@ -66,10 +46,34 @@ class PathImageFolder(datasets.ImageFolder):
         return sample, target, path
 
 
+class FusionImageFolder(PathImageFolder):
+    """Retorna (img_tensor, tab_tensor, target) usando lookup embutido (pickle-safe)."""
+    def __init__(self, root, transform, tab_lookup, cols_order):
+        super().__init__(root, transform=transform)
+        self.tab = tab_lookup
+        self.cols_order = cols_order
+
+    def __getitem__(self, index):
+        from pathlib import Path
+        import torch, numpy as np
+        path, target = self.samples[index]
+        sample = self.loader(path)
+        if self.transform is not None:
+            sample = self.transform(sample)
+        fname = Path(path).name  # '<sha1>.jpg'
+        v = self.tab.vector_for_name(fname)
+        if v is None:
+            v = np.zeros(len(self.cols_order), dtype=np.float32)
+        tab_tensor = torch.tensor(v, dtype=torch.float32)
+        return sample, tab_tensor, target
+
+
+# -------------------- Tabular lookup --------------------
+
 class TabularLookup:
     """
-    Lê CSVs preparados e cria vetores tabulares indexados por sha1(image_url)+'.jpg',
-    que é exatamente o nome salvo pelo downloader.
+    Lê CSVs preparados e cria vetores tabulares indexados por sha1(image_url)+'.jpg'
+    (mesmo nome salvo pelo downloader).
     """
     def __init__(self, csv_glob: str, download_ok_csv=None, *_, **__):
         paths = sorted(glob(csv_glob))
@@ -114,137 +118,27 @@ class TabularLookup:
 
         # índice por sha1_name
         dedup = self.df.drop_duplicates(subset=["sha1_name"]).set_index("sha1_name")
-        # faltar alguma base? preenche com 0
         for c in self.cols_order:
             if c not in dedup.columns:
                 dedup[c] = 0.0
         self.vecs = dedup[self.cols_order].astype(float)
-        self.vecs_by_basename = self.vecs 
 
-    def vector_for_name(self, fname: str) -> np.ndarray | None:
+        # aliases de compatibilidade (se algum chamador antigo usar)
+        self.vecs_by_basename = self.vecs
+
+    def vector_for_name(self, fname: str):
         # fname = '<sha1>.jpg'
         try:
             return self.vecs.loc[fname].to_numpy(dtype=np.float32)
         except KeyError:
             return None
-        
+
+    # compat: chamados antigos
     def vector_for_basename(self, basename: str):
-        try:
-            return self.vecs_by_basename.loc[basename].to_numpy(dtype=np.float32)
-        except KeyError:
-            return None
+        return self.vector_for_name(basename)
 
 
-def build_dataloaders_fusion(args: Args, csv_glob: str, use_weighted_sampler: bool = True):
-    """
-    Constrói DataLoaders (treino/val) para FUSÃO imagem+tabular.
-    O casamento é feito por 'basename' (<hash>.jpg) obtido do log de download.
-    """
-    data_root = Path(args.data_dir)
-    train_dir, val_dir = data_root / "train", data_root / "val"
-    train_tf, val_tf = build_transforms(args.img_size, args.aug_backend, args.aug_preset)
-
-    # carrega datasets com path
-    if train_dir.exists():
-        base_train = PathImageFolder(train_dir, transform=train_tf)
-        class_to_idx = base_train.class_to_idx
-        if val_dir.exists():
-            base_val = PathImageFolder(val_dir, transform=val_tf)
-        else:
-            full = PathImageFolder(train_dir, transform=train_tf)
-            gen = torch.Generator().manual_seed(42)
-            val_size = max(1, int(0.1 * len(full)))
-            train_size = len(full) - val_size
-            tr_subset, va_subset = random_split(full, [train_size, val_size], generator=gen)
-            base_train = PathImageFolder(train_dir, transform=train_tf)
-            base_val   = PathImageFolder(train_dir, transform=val_tf)
-            base_train.samples = [full.samples[i] for i in tr_subset.indices]
-            base_val.samples   = [full.samples[i] for i in va_subset.indices]
-    else:
-        full = PathImageFolder(data_root, transform=train_tf)
-        gen = torch.Generator().manual_seed(42)
-        val_size = max(1, int(0.1 * len(full)))
-        train_size = len(full) - val_size
-        tr_subset, va_subset = random_split(full, [train_size, val_size], generator=gen)
-        base_train = PathImageFolder(data_root, transform=train_tf)
-        base_val   = PathImageFolder(data_root, transform=val_tf)
-        base_train.samples = [full.samples[i] for i in tr_subset.indices]
-        base_val.samples   = [full.samples[i] for i in va_subset.indices]
-        class_to_idx = base_train.class_to_idx
-
-    # tabular lookup (usa data/_download_ok.csv por padrão)
-    tab = TabularLookup(csv_glob, download_ok_csv=Path(args.data_dir).parent / "_download_ok.csv")
-
-    global _FUSION_TAB
-    _FUSION_TAB = tab
-
-    # filtra amostras sem vetor tabular (por basename)
-    def filter_with_tab(base_ds: PathImageFolder):
-        kept = []
-        for p, y in base_ds.samples:
-            base = Path(p).name  # <hash>.jpg
-            v = tab.vector_for_name(base) 
-            if v is not None and np.isfinite(v).all():
-                kept.append((p, y))
-        new_ds = PathImageFolder(base_ds.root, transform=base_ds.transform)
-        new_ds.samples = kept
-        new_ds.class_to_idx = base_ds.class_to_idx
-        return new_ds
-
-    train_ds = filter_with_tab(base_train)
-    val_ds   = filter_with_tab(base_val)
-
-    # contagens e sampler ponderado (como já faz)
-    train_counts, train_samples = _counts_from_dataset(train_ds)
-    val_counts,   _             = _counts_from_dataset(val_ds)
-    num_classes = len(class_to_idx)
-
-    train_sampler = None
-    if use_weighted_sampler:
-        class_freq = torch.zeros(num_classes, dtype=torch.float)
-        for y, cnt in train_counts.items():
-            class_freq[y] = cnt
-        class_weights = 1.0 / (class_freq + 1e-8)
-        sample_weights = torch.tensor([class_weights[y] for _, y in train_samples], dtype=torch.float)
-        train_sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
-        shuffle_train = False
-    else:
-        shuffle_train = True
-
-    def collate_with_tab(batch):
-        imgs, ys, paths = zip(*batch)  # PathImageFolder retorna (img,y,path)
-        fnames = [Path(p).name for p in paths]  # "<sha1>.jpg"
-        tabs = []
-        for nm in fnames:
-            v = tab.vector_for_name(nm)  # << aqui
-            if v is None:
-                v = np.zeros(len(tab.cols_order), dtype=np.float32)
-            tabs.append(v)
-        tabs = torch.tensor(np.stack(tabs, axis=0), dtype=torch.float32)
-        imgs = torch.stack(imgs, dim=0)
-        ys   = torch.tensor(ys, dtype=torch.long)
-        return imgs, tabs, ys
-
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=shuffle_train,
-        sampler=train_sampler,
-        num_workers=args.num_workers,
-        pin_memory=False,
-        drop_last=True,
-        collate_fn=fusion_collate,
-    )
-    val_dl = DataLoader(
-        val_ds,
-        batch_size=max(8, args.batch_size // 2),
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=False,
-        collate_fn=fusion_collate,
-    )
-    return train_dl, val_dl, class_to_idx, train_counts, val_counts, tab.cols_order  # <- ordem das colunas tabulares
-
+# -------------------- Transforms --------------------
 
 class AlbumentationsTransform:
     """
@@ -254,7 +148,6 @@ class AlbumentationsTransform:
         self.augment = augment
 
     def __call__(self, img: Image.Image):
-        # Garante RGB (evita RGBA/grayscale com 1 ou 4 canais)
         if img.mode != "RGB":
             img = img.convert("RGB")
         img_np = np.array(img)  # (H, W, C), uint8
@@ -369,6 +262,8 @@ def build_transforms(img_size: int, aug_backend: str = "alb", aug_preset: str = 
     return train_tf, val_tf
 
 
+# -------------------- counts helper --------------------
+
 def _counts_from_dataset(ds):
     # Suporta ImageFolder ou Subset(ImageFolder)
     try:
@@ -381,6 +276,8 @@ def _counts_from_dataset(ds):
         counts[y] = counts.get(y, 0) + 1
     return counts, samples
 
+
+# -------------------- dataloaders (imagem pura) --------------------
 
 def build_dataloaders(args: Args, use_weighted_sampler: bool = True):
     data_root = Path(args.data_dir)
@@ -459,7 +356,115 @@ def build_dataloaders(args: Args, use_weighted_sampler: bool = True):
     return train_dl, val_dl, class_to_idx, train_counts, val_counts
 
 
-# --- K-FOLD ESTRATIFICADO ---
+# -------------------- dataloaders (fusão) --------------------
+
+def build_dataloaders_fusion(args: Args, csv_glob: str, use_weighted_sampler: bool = True):
+    """
+    Constrói DataLoaders (treino/val) para FUSÃO imagem+tabular.
+    O casamento é feito por '<sha1>.jpg' (sha1(image_url) + '.jpg').
+    """
+    data_root = Path(args.data_dir)
+    train_dir, val_dir = data_root / "train", data_root / "val"
+    train_tf, val_tf = build_transforms(args.img_size, args.aug_backend, args.aug_preset)
+
+    # carrega datasets com path
+    if train_dir.exists():
+        base_train = PathImageFolder(train_dir, transform=train_tf)
+        class_to_idx = base_train.class_to_idx
+        if val_dir.exists():
+            base_val = PathImageFolder(val_dir, transform=val_tf)
+        else:
+            full = PathImageFolder(train_dir, transform=train_tf)
+            gen = torch.Generator().manual_seed(42)
+            val_size = max(1, int(0.1 * len(full)))
+            train_size = len(full) - val_size
+            tr_subset, va_subset = random_split(full, [train_size, val_size], generator=gen)
+            base_train = PathImageFolder(train_dir, transform=train_tf)
+            base_val   = PathImageFolder(train_dir, transform=val_tf)
+            base_train.samples = [full.samples[i] for i in tr_subset.indices]
+            base_val.samples   = [full.samples[i] for i in va_subset.indices]
+    else:
+        full = PathImageFolder(data_root, transform=train_tf)
+        gen = torch.Generator().manual_seed(42)
+        val_size = max(1, int(0.1 * len(full)))
+        train_size = len(full) - val_size
+        tr_subset, va_subset = random_split(full, [train_size, val_size], generator=gen)
+        base_train = PathImageFolder(data_root, transform=train_tf)
+        base_val   = PathImageFolder(data_root, transform=val_tf)
+        base_train.samples = [full.samples[i] for i in tr_subset.indices]
+        base_val.samples   = [full.samples[i] for i in va_subset.indices]
+        class_to_idx = base_train.class_to_idx
+
+    # tabular lookup
+    tab = TabularLookup(csv_glob)
+
+    # filtra amostras sem vetor tabular
+    def filter_with_tab(base_ds: PathImageFolder):
+        kept = []
+        for p, y in base_ds.samples:
+            fname = Path(p).name  # '<sha1>.jpg'
+            v = tab.vector_for_name(fname)
+            if v is not None and np.isfinite(v).all():
+                kept.append((p, y))
+        new_ds = PathImageFolder(base_ds.root, transform=base_ds.transform)
+        new_ds.samples = kept
+        new_ds.class_to_idx = base_ds.class_to_idx
+        return new_ds
+
+    train_ds_base = filter_with_tab(base_train)
+    val_ds_base   = filter_with_tab(base_val)
+
+    # datasets finais com lookup embutido (pickle-safe)
+    train_ds = FusionImageFolder(train_ds_base.root, transform=train_ds_base.transform,
+                                 tab_lookup=tab, cols_order=tab.cols_order)
+    train_ds.samples = train_ds_base.samples
+    train_ds.class_to_idx = train_ds_base.class_to_idx
+
+    val_ds   = FusionImageFolder(val_ds_base.root, transform=val_ds_base.transform,
+                                 tab_lookup=tab, cols_order=tab.cols_order)
+    val_ds.samples = val_ds_base.samples
+    val_ds.class_to_idx = val_ds_base.class_to_idx
+
+    # contagens e sampler ponderado
+    train_counts, train_samples = _counts_from_dataset(train_ds)
+    val_counts,   _             = _counts_from_dataset(val_ds)
+    num_classes = len(class_to_idx)
+
+    train_sampler = None
+    if use_weighted_sampler:
+        class_freq = torch.zeros(num_classes, dtype=torch.float)
+        for y, cnt in train_counts.items():
+            class_freq[y] = cnt
+        class_weights = 1.0 / (class_freq + 1e-8)
+        sample_weights = torch.tensor([class_weights[y] for _, y in train_samples], dtype=torch.float)
+        train_sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+        shuffle_train = False
+    else:
+        shuffle_train = True
+
+    # DataLoaders com collate padrão
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=shuffle_train,
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+        pin_memory=False,
+        drop_last=True,
+    )
+    val_dl = DataLoader(
+        val_ds,
+        batch_size=max(8, args.batch_size // 2),
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=False,
+    )
+
+    return train_dl, val_dl, class_to_idx, train_counts, val_counts, tab.cols_order
+
+
+# -------------------- K-FOLD ESTRATIFICADO --------------------
+
 from sklearn.model_selection import StratifiedKFold
 
 def _subset_imagefolder(base_ds: datasets.ImageFolder, indices, transform):
@@ -468,6 +473,7 @@ def _subset_imagefolder(base_ds: datasets.ImageFolder, indices, transform):
     ds.samples = [base_ds.samples[i] for i in indices]
     ds.targets = [s[1] for s in ds.samples]
     return ds
+
 
 def build_kfold_dataloaders(
     args: Args,
