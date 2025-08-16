@@ -136,7 +136,7 @@ def run_training(args):
             })
         if fusion_active:
             mlflow.set_tag("fusion", "tabular")
-            mlflow.set_param("fusion_tab_csv_glob", args.fusion_tab_csv_glob)
+            mlflow.log_param("fusion_tab_csv_glob", args.fusion_tab_csv_glob)
 
         mlflow.log_params({
             "model": args.model,

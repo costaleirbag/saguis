@@ -13,6 +13,38 @@ from PIL import Image
 import pandas as pd
 from glob import glob
 from datetime import datetime
+import hashlib
+
+def sha1_name(url: str, n=16) -> str:
+    return hashlib.sha1(str(url).encode("utf-8")).hexdigest()[:n] + ".jpg"
+
+_FUSION_TAB = None  # será setado por build_dataloaders_fusion
+
+def fusion_collate(batch):
+    """
+    batch: [(img, y, path), ...] vindo de PathImageFolder
+    Usa o lookup global _FUSION_TAB para montar o tensor tabular.
+    """
+    from pathlib import Path
+    import numpy as np
+    import torch
+
+    assert _FUSION_TAB is not None, "Lookup tabular (_FUSION_TAB) não inicializado."
+
+    imgs, ys, paths = zip(*batch)
+    fnames = [Path(p).name for p in paths]  # '<sha1>.jpg'
+
+    tabs = []
+    for nm in fnames:
+        v = _FUSION_TAB.vector_for_name(nm)
+        if v is None:
+            v = np.zeros(len(_FUSION_TAB.cols_order), dtype=np.float32)
+        tabs.append(v)
+
+    tabs = torch.tensor(np.stack(tabs, axis=0), dtype=torch.float32)
+    imgs = torch.stack(imgs, dim=0)
+    ys   = torch.tensor(ys, dtype=torch.long)
+    return imgs, tabs, ys
 
 @dataclass
 class Args:
@@ -36,10 +68,10 @@ class PathImageFolder(datasets.ImageFolder):
 
 class TabularLookup:
     """
-    Lê CSVs preparados e cria vetores por 'basename' (se existir) ou pelo basename do image_url.
-    Mantém cols_order para uso consistente em treino/inferência.
+    Lê CSVs preparados e cria vetores tabulares indexados por sha1(image_url)+'.jpg',
+    que é exatamente o nome salvo pelo downloader.
     """
-    def __init__(self, csv_glob: str):
+    def __init__(self, csv_glob: str, download_ok_csv=None, *_, **__):
         paths = sorted(glob(csv_glob))
         if not paths:
             raise FileNotFoundError(f"Nenhum CSV em {csv_glob}")
@@ -48,73 +80,54 @@ class TabularLookup:
             df = pd.read_csv(p)
             if "image_url" not in df.columns:
                 raise ValueError(f"{p} precisa da coluna 'image_url'")
-            # define basename preferindo coluna pronta; senão extrai do image_url
-            if "basename" in df.columns:
-                base = df["basename"].astype(str)
-                base = base.where(base.str.len() > 0, df["image_url"].astype(str).apply(lambda s: s.split("/")[-1].split("?")[0]))
-            else:
-                base = df["image_url"].astype(str).apply(lambda s: s.split("/")[-1].split("?")[0])
-            # normaliza extensão
-            base = base.apply(lambda s: s if any(s.lower().endswith(ext) for ext in (".jpg",".jpeg",".png")) else f"{s}.jpg")
-            df["basename"] = base
+            df["sha1_name"] = df["image_url"].astype(str).apply(sha1_name)
             dfs.append(df)
         self.df = pd.concat(dfs, ignore_index=True)
         self._engineer()
 
     def _engineer(self):
-        # Datas (opcional)
+        # datas/tempo
         def parse_date(s):
-            try:
-                return datetime.strptime(str(s), "%d/%m/%Y")
-            except Exception:
-                return pd.NaT
-
-        if "observed_on" in self.df.columns:
-            dts = self.df["observed_on"].apply(parse_date)
-        else:
-            dts = pd.Series(pd.NaT, index=self.df.index)
-
+            try: return datetime.strptime(str(s), "%d/%m/%Y")
+            except: return pd.NaT
+        dts = self.df["observed_on"].apply(parse_date) if "observed_on" in self.df.columns else pd.Series(pd.NaT, index=self.df.index)
         self.df["year"] = dts.dt.year
         self.df["month"] = dts.dt.month
         self.df["dayofyear"] = dts.dt.dayofyear
-
         two_pi = 2*np.pi
         self.df["month_sin"] = np.sin(two_pi*(self.df["month"].fillna(0)/12))
         self.df["month_cos"] = np.cos(two_pi*(self.df["month"].fillna(0)/12))
         self.df["doy_sin"]   = np.sin(two_pi*(self.df["dayofyear"].fillna(0)/366))
         self.df["doy_cos"]   = np.cos(two_pi*(self.df["dayofyear"].fillna(0)/366))
 
-        # One-hot do estado (se existir)
-        if "place_state_name" in self.df.columns:
-            states = pd.get_dummies(self.df["place_state_name"].astype(str), prefix="state")
-        else:
-            states = pd.DataFrame(index=self.df.index)  # vazio
-
+        # one-hot de estado (se houver)
+        states = pd.get_dummies(self.df.get("place_state_name", pd.Series(dtype=str)).astype(str), prefix="state")
         self.df = pd.concat([self.df, states], axis=1)
 
-        # colunas que vão pro vetor tabular (ordem fixa)
-        base_cols = [
-            "latitude", "longitude", "year", "month", "dayofyear",
-            "month_sin", "month_cos", "doy_sin", "doy_cos"
+        # ordem de colunas
+        self.base_cols = [
+            "latitude","longitude","year","month","dayofyear",
+            "month_sin","month_cos","doy_sin","doy_cos"
         ]
-        # garante colunas ausentes como 0
-        for c in base_cols:
-            if c not in self.df.columns:
-                self.df[c] = 0.0
+        self.state_cols = [c for c in self.df.columns if c.startswith("state_")]
+        self.cols_order = self.base_cols + self.state_cols
 
-        state_cols = [c for c in self.df.columns if c.startswith("state_")]
-        self.cols_order = base_cols + state_cols
-
-        # index por basename (hash)
-        dedup = self.df.dropna(subset=["basename"]).drop_duplicates(subset=["basename"]).set_index("basename")
-        # seleção e cast
-        cols_present = [c for c in self.cols_order if c in dedup.columns]
-        # se algo estiver faltando, completa com 0
+        # índice por sha1_name
+        dedup = self.df.drop_duplicates(subset=["sha1_name"]).set_index("sha1_name")
+        # faltar alguma base? preenche com 0
         for c in self.cols_order:
             if c not in dedup.columns:
                 dedup[c] = 0.0
-        self.vecs_by_basename = dedup[self.cols_order].astype(float)
+        self.vecs = dedup[self.cols_order].astype(float)
+        self.vecs_by_basename = self.vecs 
 
+    def vector_for_name(self, fname: str) -> np.ndarray | None:
+        # fname = '<sha1>.jpg'
+        try:
+            return self.vecs.loc[fname].to_numpy(dtype=np.float32)
+        except KeyError:
+            return None
+        
     def vector_for_basename(self, basename: str):
         try:
             return self.vecs_by_basename.loc[basename].to_numpy(dtype=np.float32)
@@ -162,12 +175,15 @@ def build_dataloaders_fusion(args: Args, csv_glob: str, use_weighted_sampler: bo
     # tabular lookup (usa data/_download_ok.csv por padrão)
     tab = TabularLookup(csv_glob, download_ok_csv=Path(args.data_dir).parent / "_download_ok.csv")
 
+    global _FUSION_TAB
+    _FUSION_TAB = tab
+
     # filtra amostras sem vetor tabular (por basename)
     def filter_with_tab(base_ds: PathImageFolder):
         kept = []
         for p, y in base_ds.samples:
             base = Path(p).name  # <hash>.jpg
-            v = tab.vector_for_basename(base)
+            v = tab.vector_for_name(base) 
             if v is not None and np.isfinite(v).all():
                 kept.append((p, y))
         new_ds = PathImageFolder(base_ds.root, transform=base_ds.transform)
@@ -196,15 +212,15 @@ def build_dataloaders_fusion(args: Args, csv_glob: str, use_weighted_sampler: bo
         shuffle_train = True
 
     def collate_with_tab(batch):
-        imgs, ys, paths = zip(*batch)
-        bases = [Path(p).name for p in paths]  # <hash>.jpg
-        tab_vecs = []
-        for base in bases:
-            v = tab.vector_for_basename(base)
+        imgs, ys, paths = zip(*batch)  # PathImageFolder retorna (img,y,path)
+        fnames = [Path(p).name for p in paths]  # "<sha1>.jpg"
+        tabs = []
+        for nm in fnames:
+            v = tab.vector_for_name(nm)  # << aqui
             if v is None:
                 v = np.zeros(len(tab.cols_order), dtype=np.float32)
-            tab_vecs.append(v)
-        tabs = torch.tensor(np.stack(tab_vecs, axis=0), dtype=torch.float32)
+            tabs.append(v)
+        tabs = torch.tensor(np.stack(tabs, axis=0), dtype=torch.float32)
         imgs = torch.stack(imgs, dim=0)
         ys   = torch.tensor(ys, dtype=torch.long)
         return imgs, tabs, ys
@@ -217,7 +233,7 @@ def build_dataloaders_fusion(args: Args, csv_glob: str, use_weighted_sampler: bo
         num_workers=args.num_workers,
         pin_memory=False,
         drop_last=True,
-        collate_fn=collate_with_tab,
+        collate_fn=fusion_collate,
     )
     val_dl = DataLoader(
         val_ds,
@@ -225,7 +241,7 @@ def build_dataloaders_fusion(args: Args, csv_glob: str, use_weighted_sampler: bo
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=False,
-        collate_fn=collate_with_tab,
+        collate_fn=fusion_collate,
     )
     return train_dl, val_dl, class_to_idx, train_counts, val_counts, tab.cols_order  # <- ordem das colunas tabulares
 
